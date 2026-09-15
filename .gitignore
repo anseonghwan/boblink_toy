@@ -20,6 +20,7 @@ env/
 *.sqlite
 *.sqlite3
 instance/
+data/
 
 # Test and coverage artifacts
 .pytest_cache/
