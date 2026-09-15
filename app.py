@@ -1,9 +1,26 @@
 import os
+import re
+import secrets
 import sqlite3
+import time
+from collections import deque
+from contextlib import contextmanager
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
+from threading import Lock
 
-from flask import Flask, flash, redirect, render_template_string, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -11,9 +28,24 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "memo.db"))
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get(
-    "SECRET_KEY", "development-secret-key-change-before-deployment"
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+    MAX_CONTENT_LENGTH=64 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=2),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "0") == "1",
 )
+
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+MAX_TITLE_LENGTH = 120
+MAX_CONTENT_LENGTH = 10_000
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_MAX_ATTEMPTS = 10
+MAX_RATE_LIMIT_BUCKETS = 4096
+login_attempts = {}
+login_attempts_lock = Lock()
+DUMMY_PASSWORD_HASH = generate_password_hash("timing-check-only-password")
 
 PAGE = """
 <!doctype html>
@@ -22,7 +54,7 @@ PAGE = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }} · Boblink Memo</title>
-    <style>
+    <style nonce="{{ g.csp_nonce }}">
         :root {
             color-scheme: dark;
             --canvas: #0d1117;
@@ -60,7 +92,8 @@ PAGE = """
 
         a:focus-visible,
         button:focus-visible,
-        input:focus-visible {
+        input:focus-visible,
+        textarea:focus-visible {
             outline: 2px solid var(--accent-hover);
             outline-offset: 2px;
         }
@@ -71,12 +104,20 @@ PAGE = """
             padding: 64px 0;
         }
 
+        .page-shell-wide { width: min(100% - 32px, 960px); }
+
+        .site-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
         .brand {
             display: flex;
             align-items: center;
-            justify-content: center;
             gap: 10px;
-            margin-bottom: 28px;
             color: var(--text);
             font-size: 20px;
             font-weight: 650;
@@ -250,10 +291,133 @@ PAGE = """
             background: var(--border-muted);
         }
 
+        .header-actions,
+        .memo-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .inline-form { margin: 0; }
+
+        .nav-link {
+            display: inline-flex;
+            min-height: 34px;
+            align-items: center;
+            padding: 6px 10px;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+
+        .nav-link:hover {
+            border-color: var(--border);
+            background: var(--surface);
+            color: var(--text);
+            text-decoration: none;
+        }
+
+        .button-danger { background: #b62324; }
+        .button-danger:hover { background: #d1242f; }
+
+        textarea {
+            display: block;
+            width: 100%;
+            min-height: 260px;
+            resize: vertical;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--canvas);
+            color: var(--text);
+            font: inherit;
+            line-height: 1.6;
+        }
+
+        textarea:focus {
+            border-color: var(--accent-hover);
+            outline: none;
+            box-shadow: 0 0 0 3px var(--focus);
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .section-header p { margin: 4px 0 0; color: var(--text-muted); }
+
+        .memo-list {
+            display: grid;
+            gap: 12px;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+        }
+
+        .memo-item {
+            display: block;
+            padding: 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--canvas);
+            color: var(--text);
+        }
+
+        .memo-item:hover {
+            border-color: var(--accent);
+            text-decoration: none;
+        }
+
+        .memo-title { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
+        .memo-preview { margin: 0 0 10px; color: var(--text-muted); }
+        .memo-meta { color: var(--text-muted); font-size: 12px; }
+
+        .empty-state {
+            padding: 48px 20px;
+            border: 1px dashed var(--border);
+            border-radius: 6px;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .note-content {
+            min-height: 180px;
+            margin: 0;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            color: var(--text);
+            font-family: inherit;
+        }
+
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table th, .data-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+        }
+        .data-table th { color: var(--text-muted); font-size: 12px; }
+        .table-wrap { overflow-x: auto; }
+        .badge {
+            display: inline-block;
+            padding: 2px 7px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+        .badge-admin { border-color: var(--success-border); color: #3fb950; }
+
         @media (max-width: 520px) {
             .page-shell { width: min(100% - 24px, 440px); padding: 32px 0; }
             .card-header, .card-body { padding-right: 20px; padding-left: 20px; }
             .flash-list { margin-right: 20px; margin-left: 20px; }
+            .site-header, .section-header { align-items: flex-start; flex-direction: column; }
+            .header-actions { width: 100%; flex-wrap: wrap; }
         }
 
         @media (prefers-reduced-motion: reduce) {
@@ -262,11 +426,25 @@ PAGE = """
     </style>
 </head>
 <body>
-    <main class="page-shell">
-        <a class="brand" href="{{ url_for('index') }}" aria-label="Boblink Memo 홈">
-            <span class="brand-mark" aria-hidden="true">B</span>
-            <span>Boblink Memo</span>
-        </a>
+    <main class="page-shell{% if wide %} page-shell-wide{% endif %}">
+        <header class="site-header">
+            <a class="brand" href="{{ url_for('index') }}" aria-label="Boblink Memo 홈">
+                <span class="brand-mark" aria-hidden="true">B</span>
+                <span>Boblink Memo</span>
+            </a>
+            {% if g.user %}
+                <nav class="header-actions" aria-label="주요 메뉴">
+                    <a class="nav-link" href="{{ url_for('index') }}">내 메모</a>
+                    {% if g.user['is_admin'] %}
+                        <a class="nav-link" href="{{ url_for('admin_users') }}">관리자</a>
+                    {% endif %}
+                    <form class="inline-form" method="post" action="{{ url_for('logout') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button class="button-secondary" type="submit">로그아웃</button>
+                    </form>
+                </nav>
+            {% endif %}
+        </header>
 
         <section class="card" aria-labelledby="page-title">
             <header class="card-header">
@@ -292,10 +470,17 @@ PAGE = """
 """
 
 
+@contextmanager
 def get_db():
-    connection = sqlite3.connect(DATABASE)
+    connection = sqlite3.connect(DATABASE, timeout=5)
     connection.row_factory = sqlite3.Row
-    return connection
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def init_db():
@@ -305,21 +490,146 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)")
+        }
+        if "is_admin" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+            )
+        if "created_at" not in columns:
+            connection.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+            connection.execute(
+                "UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
+            )
 
-def render_page(title, content, **context):
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+                content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 10000),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notes_user_updated "
+            "ON notes (user_id, updated_at DESC, id DESC)"
+        )
+
+
+def bootstrap_admin():
+    password = os.environ.get("ADMIN_PASSWORD")
+    flag = os.environ.get("CTF_FLAG")
+    if not password:
+        return
+    if not 16 <= len(password) <= 128:
+        raise RuntimeError("ADMIN_PASSWORD must contain 16 to 128 characters.")
+    if flag and not re.fullmatch(r"SBOB\{[^{}]{8,128}\}", flag):
+        raise RuntimeError("CTF_FLAG must use the SBOB{...} format.")
+
+    with get_db() as connection:
+        admin = connection.execute(
+            "SELECT id, is_admin FROM users WHERE username = ?", ("admin",)
+        ).fetchone()
+        if admin is None:
+            cursor = connection.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                ("admin", generate_password_hash(password)),
+            )
+            admin_id = cursor.lastrowid
+        elif not admin["is_admin"]:
+            raise RuntimeError("The reserved admin username is already in use.")
+        else:
+            admin_id = admin["id"]
+
+        if flag:
+            exists = connection.execute(
+                "SELECT 1 FROM notes WHERE user_id = ? AND title = ?",
+                (admin_id, "[SYSTEM] Boblink CTF verification"),
+            ).fetchone()
+            if exists is None:
+                connection.execute(
+                    "INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)",
+                    (admin_id, "[SYSTEM] Boblink CTF verification", flag),
+                )
+
+
+def csrf_token():
+    token = session.get("csrf_token")
+    if token is None:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+@app.before_request
+def prepare_request():
+    g.csp_nonce = secrets.token_urlsafe(18)
+    g.user = None
+    user_id = session.get("user_id")
+    if user_id is not None:
+        with get_db() as connection:
+            g.user = connection.execute(
+                "SELECT id, username, is_admin, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        if g.user is None:
+            session.clear()
+
+    expected_token = csrf_token()
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        submitted_token = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(expected_token, submitted_token):
+            abort(400, description="Invalid request token.")
+
+
+@app.after_request
+def set_security_headers(response):
+    nonce = getattr(g, "csp_nonce", "")
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"style-src 'nonce-{nonce}'; "
+        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; "
+        "base-uri 'none'; object-src 'none'"
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
+
+
+def render_page(page_title, content, *, wide=False, **context):
+    context["csrf_token"] = csrf_token()
     rendered_content = render_template_string(content, **context)
-    return render_template_string(PAGE, title=title, content=rendered_content)
+    return render_template_string(
+        PAGE,
+        title=page_title,
+        content=rendered_content,
+        csrf_token=context["csrf_token"],
+        wide=wide,
+    )
 
 
 def login_required(view):
     @wraps(view)
     def wrapped_view(*args, **kwargs):
-        if "user_id" not in session:
+        if g.user is None:
             flash("로그인이 필요합니다.", "info")
             return redirect(url_for("login"))
         return view(*args, **kwargs)
@@ -327,39 +637,295 @@ def login_required(view):
     return wrapped_view
 
 
+def admin_required(view):
+    @wraps(view)
+    @login_required
+    def wrapped_view(*args, **kwargs):
+        if not g.user["is_admin"]:
+            abort(404)
+        return view(*args, **kwargs)
+
+    return wrapped_view
+
+
+def auth_rate_limited(scope, limit):
+    key = (scope, request.remote_addr or "unknown")
+    now = time.monotonic()
+    with login_attempts_lock:
+        if key not in login_attempts and len(login_attempts) >= MAX_RATE_LIMIT_BUCKETS:
+            expired = [
+                item_key
+                for item_key, item_bucket in login_attempts.items()
+                if not item_bucket or now - item_bucket[-1] > LOGIN_WINDOW_SECONDS
+            ]
+            for item_key in expired:
+                login_attempts.pop(item_key, None)
+            if len(login_attempts) >= MAX_RATE_LIMIT_BUCKETS:
+                return True
+
+        bucket = login_attempts.setdefault(key, deque())
+        while bucket and now - bucket[0] > LOGIN_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return True
+        bucket.append(now)
+        return False
+
+
+def validate_note(title, content):
+    title = title.strip()
+    content = content.strip()
+    if not title:
+        return title, content, "제목을 입력해주세요."
+    if len(title) > MAX_TITLE_LENGTH:
+        return title, content, f"제목은 {MAX_TITLE_LENGTH}자 이하여야 합니다."
+    if not content:
+        return title, content, "내용을 입력해주세요."
+    if len(content) > MAX_CONTENT_LENGTH:
+        return title, content, f"내용은 {MAX_CONTENT_LENGTH}자 이하여야 합니다."
+    return title, content, None
+
+
+def get_owned_note(note_id):
+    with get_db() as connection:
+        note = connection.execute(
+            "SELECT id, title, content, created_at, updated_at "
+            "FROM notes WHERE id = ? AND user_id = ?",
+            (note_id, g.user["id"]),
+        ).fetchone()
+    if note is None:
+        abort(404)
+    return note
+
+
 @app.route("/")
 @login_required
 def index():
+    with get_db() as connection:
+        notes = connection.execute(
+            "SELECT id, title, content, created_at, updated_at "
+            "FROM notes WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+            (g.user["id"],),
+        ).fetchall()
+
     content = """
-    <div class="welcome">
-        <div class="avatar" aria-hidden="true">{{ username[0]|upper }}</div>
+    <div class="section-header">
         <div>
-            <p class="welcome-title">{{ username }}님, 반갑습니다.</p>
-            <p class="welcome-copy">안전하게 로그인되어 있습니다.</p>
+            <h2 class="memo-title">{{ g.user['username'] }}님의 메모</h2>
+            <p>나만 볼 수 있는 메모를 안전하게 관리하세요.</p>
+        </div>
+        <a class="button" href="{{ url_for('create_note') }}">새 메모</a>
+    </div>
+    {% if notes %}
+        <ul class="memo-list">
+            {% for note in notes %}
+                <li>
+                    <a class="memo-item" href="{{ url_for('note_detail', note_id=note['id']) }}">
+                        <p class="memo-title">{{ note['title'] }}</p>
+                        <p class="memo-preview">{{ note['content']|truncate(120) }}</p>
+                        <span class="memo-meta">최근 수정 {{ note['updated_at'] }}</span>
+                    </a>
+                </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <div class="empty-state">아직 작성한 메모가 없습니다.</div>
+    {% endif %}
+    """
+    return render_page("내 메모", content, notes=notes, wide=True)
+
+
+@app.route("/notes/new", methods=["GET", "POST"])
+@login_required
+def create_note():
+    title = ""
+    note_content = ""
+    if request.method == "POST":
+        title, note_content, error = validate_note(
+            request.form.get("title", ""), request.form.get("content", "")
+        )
+        if error is None:
+            with get_db() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)",
+                    (g.user["id"], title, note_content),
+                )
+            flash("메모를 저장했습니다.", "success")
+            return redirect(url_for("note_detail", note_id=cursor.lastrowid))
+        flash(error, "error")
+
+    content = """
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <p class="field">
+            <label for="title">제목</label>
+            <input id="title" name="title" maxlength="120" value="{{ title }}" required autofocus>
+        </p>
+        <p class="field">
+            <label for="content">내용</label>
+            <textarea id="content" name="content" maxlength="10000" required>{{ note_content }}</textarea>
+        </p>
+        <div class="memo-actions">
+            <button type="submit">저장</button>
+            <a class="button button-secondary" href="{{ url_for('index') }}">취소</a>
+        </div>
+    </form>
+    """
+    return render_page(
+        "새 메모", content, title=title, note_content=note_content, wide=True
+    )
+
+
+@app.route("/notes/<int:note_id>")
+@login_required
+def note_detail(note_id):
+    note = get_owned_note(note_id)
+    content = """
+    <div class="section-header">
+        <div>
+            <h2 class="memo-title">{{ note['title'] }}</h2>
+            <p>최근 수정 {{ note['updated_at'] }}</p>
+        </div>
+        <div class="memo-actions">
+            <a class="button button-secondary" href="{{ url_for('edit_note', note_id=note['id']) }}">수정</a>
+            <form class="inline-form" method="post" action="{{ url_for('delete_note', note_id=note['id']) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="button-danger" type="submit">삭제</button>
+            </form>
         </div>
     </div>
     <hr class="divider">
-    <p class="welcome-copy">메모 기능은 다음 단계에서 이곳에 추가됩니다.</p>
-    <p><a class="button button-secondary button-block" href="{{ url_for('logout') }}">로그아웃</a></p>
+    <div class="note-content">{{ note['content'] }}</div>
+    <hr class="divider">
+    <a href="{{ url_for('index') }}">← 메모 목록</a>
     """
-    return render_page("메모 서비스", content, username=session["username"])
+    return render_page("메모 상세", content, note=note, wide=True)
+
+
+@app.route("/notes/<int:note_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_note(note_id):
+    note = get_owned_note(note_id)
+    title = note["title"]
+    note_content = note["content"]
+    if request.method == "POST":
+        title, note_content, error = validate_note(
+            request.form.get("title", ""), request.form.get("content", "")
+        )
+        if error is None:
+            with get_db() as connection:
+                result = connection.execute(
+                    "UPDATE notes SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND user_id = ?",
+                    (title, note_content, note_id, g.user["id"]),
+                )
+            if result.rowcount != 1:
+                abort(404)
+            flash("메모를 수정했습니다.", "success")
+            return redirect(url_for("note_detail", note_id=note_id))
+        flash(error, "error")
+
+    content = """
+    <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <p class="field">
+            <label for="title">제목</label>
+            <input id="title" name="title" maxlength="120" value="{{ title }}" required autofocus>
+        </p>
+        <p class="field">
+            <label for="content">내용</label>
+            <textarea id="content" name="content" maxlength="10000" required>{{ note_content }}</textarea>
+        </p>
+        <div class="memo-actions">
+            <button type="submit">변경사항 저장</button>
+            <a class="button button-secondary" href="{{ url_for('note_detail', note_id=note['id']) }}">취소</a>
+        </div>
+    </form>
+    """
+    return render_page(
+        "메모 수정",
+        content,
+        note=note,
+        title=title,
+        note_content=note_content,
+        wide=True,
+    )
+
+
+@app.post("/notes/<int:note_id>/delete")
+@login_required
+def delete_note(note_id):
+    with get_db() as connection:
+        result = connection.execute(
+            "DELETE FROM notes WHERE id = ? AND user_id = ?",
+            (note_id, g.user["id"]),
+        )
+    if result.rowcount != 1:
+        abort(404)
+    flash("메모를 삭제했습니다.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/admin/users")
+@admin_required
+def admin_users():
+    with get_db() as connection:
+        users = connection.execute(
+            "SELECT u.id, u.username, u.is_admin, u.created_at, COUNT(n.id) AS note_count "
+            "FROM users AS u LEFT JOIN notes AS n ON n.user_id = u.id "
+            "GROUP BY u.id, u.username, u.is_admin, u.created_at "
+            "ORDER BY u.id ASC"
+        ).fetchall()
+
+    content = """
+    <div class="section-header">
+        <div>
+            <h2 class="memo-title">전체 회원</h2>
+            <p>관리자만 접근할 수 있는 회원 현황입니다.</p>
+        </div>
+        <span class="badge">{{ users|length }}명</span>
+    </div>
+    <div class="table-wrap">
+        <table class="data-table">
+            <thead><tr><th>ID</th><th>아이디</th><th>권한</th><th>메모</th><th>가입일</th></tr></thead>
+            <tbody>
+                {% for user in users %}
+                    <tr>
+                        <td>{{ user['id'] }}</td>
+                        <td>{{ user['username'] }}</td>
+                        <td>
+                            <span class="badge{% if user['is_admin'] %} badge-admin{% endif %}">
+                                {{ 'admin' if user['is_admin'] else 'member' }}
+                            </span>
+                        </td>
+                        <td>{{ user['note_count'] }}</td>
+                        <td>{{ user['created_at'] }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_page("관리자", content, users=users, wide=True)
 
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
-    if "user_id" in session:
+    if g.user is not None:
         return redirect(url_for("index"))
 
     if request.method == "POST":
+        if auth_rate_limited("signup", 5):
+            abort(429)
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         password_confirm = request.form.get("password_confirm", "")
 
         error = None
-        if not username:
-            error = "아이디를 입력해주세요."
-        elif not password:
-            error = "비밀번호를 입력해주세요."
+        if not USERNAME_PATTERN.fullmatch(username):
+            error = "아이디는 영문, 숫자, 점, 밑줄, 하이픈으로 3~32자여야 합니다."
+        elif not 12 <= len(password) <= 128:
+            error = "비밀번호는 12~128자여야 합니다."
         elif password != password_confirm:
             error = "비밀번호가 일치하지 않습니다."
 
@@ -375,22 +941,22 @@ def signup():
             else:
                 flash("회원가입이 완료되었습니다. 로그인해주세요.", "success")
                 return redirect(url_for("login"))
-
         flash(error, "error")
 
     content = """
     <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <p class="field">
             <label for="username">아이디</label>
-            <input id="username" name="username" autocomplete="username" required autofocus>
+            <input id="username" name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" autocomplete="username" required autofocus>
         </p>
         <p class="field">
             <label for="password">비밀번호</label>
-            <input id="password" type="password" name="password" autocomplete="new-password" required>
+            <input id="password" type="password" name="password" minlength="12" maxlength="128" autocomplete="new-password" required>
         </p>
         <p class="field">
             <label for="password-confirm">비밀번호 확인</label>
-            <input id="password-confirm" type="password" name="password_confirm" autocomplete="new-password" required>
+            <input id="password-confirm" type="password" name="password_confirm" minlength="12" maxlength="128" autocomplete="new-password" required>
         </p>
         <button class="button-block" type="submit">계정 만들기</button>
     </form>
@@ -401,45 +967,58 @@ def signup():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if "user_id" in session:
+    if g.user is not None:
         return redirect(url_for("index"))
 
     if request.method == "POST":
+        if auth_rate_limited("login", LOGIN_MAX_ATTEMPTS):
+            flash("로그인 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.", "error")
+            return render_page("로그인", LOGIN_FORM), 429
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        user = None
+        password_to_check = password if len(password) <= 128 else ""
+        if len(username) <= 32:
+            with get_db() as connection:
+                user = connection.execute(
+                    "SELECT id, username, password_hash FROM users WHERE username = ?",
+                    (username,),
+                ).fetchone()
 
-        with get_db() as connection:
-            user = connection.execute(
-                "SELECT id, username, password_hash FROM users WHERE username = ?",
-                (username,),
-            ).fetchone()
-
-        if user is None or not check_password_hash(user["password_hash"], password):
+        password_hash = user["password_hash"] if user else DUMMY_PASSWORD_HASH
+        password_is_valid = check_password_hash(password_hash, password_to_check)
+        if user is None or not password_is_valid:
             flash("아이디 또는 비밀번호가 올바르지 않습니다.", "error")
         else:
             session.clear()
             session["user_id"] = user["id"]
-            session["username"] = user["username"]
+            session["csrf_token"] = secrets.token_urlsafe(32)
+            session.permanent = True
             return redirect(url_for("index"))
 
-    content = """
-    <form method="post">
-        <p class="field">
-            <label for="username">아이디</label>
-            <input id="username" name="username" autocomplete="username" required autofocus>
-        </p>
-        <p class="field">
-            <label for="password">비밀번호</label>
-            <input id="password" type="password" name="password" autocomplete="current-password" required>
-        </p>
-        <button class="button-block" type="submit">로그인</button>
-    </form>
-    <p class="auth-switch">처음 오셨나요? <a href="{{ url_for('signup') }}">계정 만들기</a></p>
-    """
-    return render_page("로그인", content)
+    return render_page("로그인", LOGIN_FORM)
 
 
-@app.route("/logout")
+LOGIN_FORM = """
+<form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p class="field">
+        <label for="username">아이디</label>
+        <input id="username" name="username" maxlength="32" autocomplete="username" required autofocus>
+    </p>
+    <p class="field">
+        <label for="password">비밀번호</label>
+        <input id="password" type="password" name="password" maxlength="128" autocomplete="current-password" required>
+    </p>
+    <button class="button-block" type="submit">로그인</button>
+</form>
+<p class="auth-switch">처음 오셨나요? <a href="{{ url_for('signup') }}">계정 만들기</a></p>
+"""
+
+
+@app.post("/logout")
+@login_required
 def logout():
     session.clear()
     flash("로그아웃되었습니다.", "success")
@@ -447,7 +1026,8 @@ def logout():
 
 
 init_db()
+bootstrap_admin()
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1")

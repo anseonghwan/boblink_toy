@@ -3,7 +3,7 @@
 ## Source of truth
 - Status: Active
 - Last refreshed: 2026-09-15
-- Primary product surfaces: 회원가입, 로그인, 로그인 후 메모 홈
+- Primary product surfaces: 회원가입, 로그인, 메모 목록·작성·상세·수정, 관리자 회원 목록
 - Evidence reviewed: `app.py`, `README.md`; 별도 디자인 문서, 이미지, 로고, 컴포넌트 자산은 없음
 
 ## Brand
@@ -22,8 +22,8 @@
 - Key contexts of use: 데스크톱 및 모바일 브라우저의 짧은 개인 작업
 
 ## Information architecture
-- Primary navigation: 브랜드 홈 링크, 인증 화면 간 전환 링크, 로그아웃
-- Core routes/screens: `/signup`, `/login`, `/`
+- Primary navigation: 브랜드 홈 링크, 내 메모, 관리자(관리자 전용), 로그아웃
+- Core routes/screens: `/signup`, `/login`, `/`, `/notes/new`, `/notes/<id>`, `/notes/<id>/edit`, `/admin/users`
 - Content hierarchy: 브랜드 → 화면 제목 → 상태 메시지 → 핵심 폼 또는 로그인 상태 → 보조 행동
 
 ## Design principles
@@ -41,7 +41,7 @@
 
 ## Components
 - Existing components to reuse: 공통 페이지 셸, 카드, 플래시 메시지, 필드, 버튼, 인증 전환 링크
-- New/changed components: 향후 메모 목록과 편집기는 같은 표면·테두리·버튼 토큰을 확장
+- New/changed components: 메모 목록·편집기·상세 행동 영역, 빈 상태, 관리자 회원 테이블과 권한 배지
 - Variants and states: 주요/보조 버튼, 기본/hover/focus 입력, 오류·상태 메시지
 - Token/component ownership: 현재는 `app.py`의 `:root` CSS 변수가 단일 소스
 
@@ -59,7 +59,7 @@
 
 ## Interaction states
 - Loading: 현재 동기식 요청이므로 별도 상태 없음
-- Empty: 로그인 홈에서 메모 기능 추가 예정 안내 표시
+- Empty: 메모가 없을 때 목록 영역에 명확한 빈 상태 표시
 - Error: 카드 내부 붉은 톤의 상태 메시지
 - Success: 회원가입·로그아웃 결과를 다음 화면의 상태 메시지로 표시
 - Disabled: 현재 사용하지 않음
@@ -72,10 +72,11 @@
 
 ## Implementation constraints
 - Framework/styling system: Flask 단일 `app.py`, 템플릿과 CSS도 파일 내부 유지
+- Security constraints: 사용자별 객체 권한, CSRF 토큰, 출력 이스케이프, CSP와 보안 헤더를 모든 신규 화면에 유지
 - Design-token constraints: 색상은 `:root` 사용자 정의 속성을 우선 사용
 - Performance constraints: 외부 폰트·이미지·CSS 의존성 없이 렌더링
 - Compatibility constraints: CSS Grid/Flex 및 사용자 정의 속성을 지원하는 최신 브라우저
 - Test/screenshot expectations: 인증 흐름 테스트와 각 핵심 화면의 모바일·데스크톱 육안 확인
 
 ## Open questions
-- [ ] 실제 메모 목록이 추가될 때 카드 중심 레이아웃을 넓은 앱 셸로 확장할 범위 / 제품 담당 / 메모 화면 정보 구조에 영향
+- [ ] 실제 배포 환경의 HTTPS 종료 지점과 `SESSION_COOKIE_SECURE` 설정 / 운영 담당 / 세션 쿠키 보호에 영향
