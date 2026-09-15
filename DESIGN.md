@@ -73,6 +73,7 @@
 ## Implementation constraints
 - Framework/styling system: Flask 단일 `app.py`, 템플릿과 CSS도 파일 내부 유지
 - Security constraints: 사용자별 객체 권한, CSRF 토큰, 출력 이스케이프, CSP와 보안 헤더를 모든 신규 화면에 유지
+- Resource constraints: 사용자당 메모 100개, 제목·본문 합계 1 MiB로 제한하고 목록에 현재 사용량 표시
 - Design-token constraints: 색상은 `:root` 사용자 정의 속성을 우선 사용
 - Performance constraints: 외부 폰트·이미지·CSS 의존성 없이 렌더링
 - Compatibility constraints: CSS Grid/Flex 및 사용자 정의 속성을 지원하는 최신 브라우저

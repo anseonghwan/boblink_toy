@@ -34,12 +34,14 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=2),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "0") == "1",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") != "0",
 )
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 MAX_TITLE_LENGTH = 120
 MAX_CONTENT_LENGTH = 10_000
+MAX_NOTES_PER_USER = 100
+MAX_USER_STORAGE_BYTES = 1024 * 1024
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 10
 MAX_RATE_LIMIT_BUCKETS = 4096
@@ -686,6 +688,32 @@ def validate_note(title, content):
     return title, content, None
 
 
+def note_storage_bytes(title, content):
+    return len(title.encode("utf-8")) + len(content.encode("utf-8"))
+
+
+def get_note_usage(connection, user_id, exclude_note_id=None):
+    query = (
+        "SELECT COUNT(*) AS note_count, "
+        "COALESCE(SUM(length(CAST(title AS BLOB)) + "
+        "length(CAST(content AS BLOB))), 0) AS storage_bytes "
+        "FROM notes WHERE user_id = ?"
+    )
+    parameters = [user_id]
+    if exclude_note_id is not None:
+        query += " AND id != ?"
+        parameters.append(exclude_note_id)
+    return connection.execute(query, parameters).fetchone()
+
+
+def format_storage(byte_count):
+    if byte_count < 1024:
+        return f"{byte_count} B"
+    if byte_count >= 1024 * 1024:
+        return f"{byte_count / (1024 * 1024):.1f} MiB"
+    return f"{byte_count / 1024:.1f} KiB"
+
+
 def get_owned_note(note_id):
     with get_db() as connection:
         note = connection.execute(
@@ -707,12 +735,16 @@ def index():
             "FROM notes WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
             (g.user["id"],),
         ).fetchall()
+        usage = get_note_usage(connection, g.user["id"])
 
     content = """
     <div class="section-header">
         <div>
             <h2 class="memo-title">{{ g.user['username'] }}님의 메모</h2>
-            <p>나만 볼 수 있는 메모를 안전하게 관리하세요.</p>
+            <p>
+                {{ usage['note_count'] }}/{{ max_notes }}개 ·
+                {{ storage_used }}/{{ storage_limit }} 사용
+            </p>
         </div>
         <a class="button" href="{{ url_for('create_note') }}">새 메모</a>
     </div>
@@ -732,7 +764,16 @@ def index():
         <div class="empty-state">아직 작성한 메모가 없습니다.</div>
     {% endif %}
     """
-    return render_page("내 메모", content, notes=notes, wide=True)
+    return render_page(
+        "내 메모",
+        content,
+        notes=notes,
+        usage=usage,
+        max_notes=MAX_NOTES_PER_USER,
+        storage_used=format_storage(usage["storage_bytes"]),
+        storage_limit=format_storage(MAX_USER_STORAGE_BYTES),
+        wide=True,
+    )
 
 
 @app.route("/notes/new", methods=["GET", "POST"])
@@ -746,12 +787,25 @@ def create_note():
         )
         if error is None:
             with get_db() as connection:
-                cursor = connection.execute(
-                    "INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)",
-                    (g.user["id"], title, note_content),
-                )
-            flash("메모를 저장했습니다.", "success")
-            return redirect(url_for("note_detail", note_id=cursor.lastrowid))
+                connection.execute("BEGIN IMMEDIATE")
+                usage = get_note_usage(connection, g.user["id"])
+                new_size = note_storage_bytes(title, note_content)
+                if usage["note_count"] >= MAX_NOTES_PER_USER:
+                    error = f"메모는 최대 {MAX_NOTES_PER_USER}개까지 저장할 수 있습니다."
+                elif usage["storage_bytes"] + new_size > MAX_USER_STORAGE_BYTES:
+                    error = (
+                        "사용자당 메모 저장 용량 "
+                        f"{format_storage(MAX_USER_STORAGE_BYTES)}를 초과했습니다."
+                    )
+                else:
+                    cursor = connection.execute(
+                        "INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)",
+                        (g.user["id"], title, note_content),
+                    )
+                    note_id = cursor.lastrowid
+            if error is None:
+                flash("메모를 저장했습니다.", "success")
+                return redirect(url_for("note_detail", note_id=note_id))
         flash(error, "error")
 
     content = """
@@ -814,15 +868,31 @@ def edit_note(note_id):
         )
         if error is None:
             with get_db() as connection:
-                result = connection.execute(
-                    "UPDATE notes SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE id = ? AND user_id = ?",
-                    (title, note_content, note_id, g.user["id"]),
+                connection.execute("BEGIN IMMEDIATE")
+                usage = get_note_usage(
+                    connection, g.user["id"], exclude_note_id=note_id
                 )
-            if result.rowcount != 1:
-                abort(404)
-            flash("메모를 수정했습니다.", "success")
-            return redirect(url_for("note_detail", note_id=note_id))
+                if (
+                    usage["storage_bytes"]
+                    + note_storage_bytes(title, note_content)
+                    > MAX_USER_STORAGE_BYTES
+                ):
+                    error = (
+                        "사용자당 메모 저장 용량 "
+                        f"{format_storage(MAX_USER_STORAGE_BYTES)}를 초과했습니다."
+                    )
+                else:
+                    result = connection.execute(
+                        "UPDATE notes SET title = ?, content = ?, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND user_id = ?",
+                        (title, note_content, note_id, g.user["id"]),
+                    )
+                    if result.rowcount != 1:
+                        abort(404)
+            if error is None:
+                flash("메모를 수정했습니다.", "success")
+                return redirect(url_for("note_detail", note_id=note_id))
         flash(error, "error")
 
     content = """
